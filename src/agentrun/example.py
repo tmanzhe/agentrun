@@ -49,6 +49,8 @@ def mock_model(context: StepContext, value: dict | None) -> dict:
         ).fetchone()
     if receipt["requests"] == 1:
         time.sleep(delay)
+    # A deduplicated provider response still reports the original call's usage.
+    context.report_usage(input_tokens=10, output_tokens=5, cost_usd="0.10")
     return receipt["result"]
 
 
