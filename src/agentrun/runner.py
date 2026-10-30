@@ -6,7 +6,7 @@ use a new job type name when changing a workflow.
 """
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
@@ -81,6 +81,17 @@ CREATE TABLE IF NOT EXISTS step_attempts (
     next_attempt_at timestamptz,
     PRIMARY KEY (job_id, step_name, input_hash)
 );
+CREATE TABLE IF NOT EXISTS attempt_usage (
+    job_id uuid NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    step_name text NOT NULL,
+    input_hash text NOT NULL,
+    attempt_number integer NOT NULL,
+    input_tokens bigint NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
+    output_tokens bigint NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+    cost_usd numeric NOT NULL DEFAULT 0
+        CHECK (cost_usd >= 0 AND cost_usd < 'Infinity'::numeric),
+    PRIMARY KEY (job_id, step_name, input_hash, attempt_number)
+);
 CREATE TABLE IF NOT EXISTS job_cancellations (
     job_id uuid PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE
 );
@@ -133,6 +144,8 @@ class StepContext:
     output_tokens: int = 0
     cost_usd: Decimal = Decimal("0")
 
+    _record_usage: Callable | None = field(default=None, repr=False, compare=False)
+
     def report_usage(
         self, *, input_tokens: int = 0, output_tokens: int = 0,
         cost_usd: Decimal | float | str = 0,
@@ -142,6 +155,8 @@ class StepContext:
             if isinstance(count, bool) or not isinstance(count, int) or count < 0:
                 raise ValueError("Token counts must be nonnegative integers")
         amount = dollars(cost_usd)
+        if self._record_usage is not None:
+            self._record_usage(input_tokens, output_tokens, amount)
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
         self.cost_usd += amount
@@ -254,8 +269,13 @@ class Runner:
                        WHERE job_id = %s ORDER BY completed_at, step_name""",
                     (job_id,),
                 ).fetchall()
-                for field in ("input_tokens", "output_tokens", "cost_usd"):
-                    job[field] = sum((step[field] for step in job["steps"]), 0)
+                job.update(self._usage_totals(conn, job_id))
+                job["attempt_usage"] = conn.execute(
+                    """SELECT step_name, input_hash, attempt_number,
+                              input_tokens, output_tokens, cost_usd
+                       FROM attempt_usage WHERE job_id = %s
+                       ORDER BY step_name, input_hash, attempt_number""", (job_id,),
+                ).fetchall()
                 job["attempts"] = conn.execute(
                     """SELECT step_name, input_hash, attempt_count, last_error, next_attempt_at,
                               input, started_at, finished_at, interrupted_count
@@ -267,6 +287,22 @@ class Runner:
                 ).fetchone():
                     job["status"] = "cancelled"
             return job
+
+    @staticmethod
+    def _usage_totals(conn, job_id: UUID) -> dict:
+        return conn.execute(
+            """SELECT COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
+                      COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
+                      COALESCE(SUM(cost_usd), 0) AS cost_usd
+               FROM (
+                   SELECT input_tokens, output_tokens, cost_usd FROM attempt_usage WHERE job_id = %s
+                   UNION ALL
+                   SELECT input_tokens, output_tokens, cost_usd FROM steps s WHERE job_id = %s
+                     AND NOT EXISTS (SELECT 1 FROM attempt_usage a
+                         WHERE a.job_id = s.job_id AND a.step_name = s.step_name
+                           AND a.input_hash = s.input_hash)
+               ) usage""", (job_id, job_id),
+        ).fetchone()
 
     def replay(self, job_id: UUID, out_dir):
         """Export a consistent database snapshot as a standalone HTML replay."""
@@ -383,16 +419,10 @@ class Runner:
                 if saved is not None:
                     self._renew(conn, job)
                     return saved["result"]
-                # Check only unsaved steps, under the claim lock. A step may
-                # cross the cap; its price is only known after it returns.
-                # Failed-attempt spend is excluded from BOTH job totals and the
-                # cap: only usage committed with a successful result counts.
+                # Every attempt's reported usage counts, including failures,
+                # timeouts and interruptions. Check before each uncached attempt.
                 if job["max_usd"] is not None:
-                    spend = conn.execute(
-                        "SELECT COALESCE(SUM(cost_usd), 0) AS total FROM steps WHERE job_id = %s",
-                        (job["id"],),
-                    ).fetchone()["total"]
-                    if spend >= job["max_usd"]:
+                    if self._usage_totals(conn, job["id"])["cost_usd"] >= job["max_usd"]:
                         raise OverBudget("Recorded spend reached the job's max_usd")
                 attempt = conn.execute(
                     """SELECT *, EXTRACT(EPOCH FROM next_attempt_at - clock_timestamp()) AS wait
@@ -408,6 +438,10 @@ class Runner:
                     while (remaining := deadline - time.monotonic()) > 0:
                         time.sleep(min(0.05, remaining))
                         self._lock_claim(conn, job)
+                # Timed-out code can report more usage during backoff.
+                if job["max_usd"] is not None:
+                    if self._usage_totals(conn, job["id"])["cost_usd"] >= job["max_usd"]:
+                        raise OverBudget("Recorded spend reached the job's max_usd")
                 # Commit before user code: even an interrupted attempt counts.
                 # Saved successes are checked first and never consume attempts.
                 attempt = conn.execute(
@@ -423,11 +457,32 @@ class Runner:
                                finished_at = NULL
                        RETURNING attempt_count""", (*key, Jsonb(value)),
                 ).fetchone()
+                conn.execute(
+                    """INSERT INTO attempt_usage (job_id, step_name, input_hash, attempt_number)
+                       VALUES (%s, %s, %s, %s)""", (*key, attempt["attempt_count"]),
+                )
                 self._renew(conn, job)
             with conn.transaction():
                 # Fence stale workers even when execution outlives the lease.
                 self._lock_claim(conn, job)
-                context = StepContext(job["id"], step.name, digest, self.database_url)
+                # Capture the key because a timed-out thread may report later.
+                usage_key = (*key, attempt["attempt_count"])
+
+                def record_usage(inputs, outputs, cost, usage_key=usage_key):
+                    # Persist before returning from report_usage, independently
+                    # of the result transaction. Never replay usage at finish.
+                    with self.connect() as usage_conn:
+                        usage_conn.execute(
+                            """UPDATE attempt_usage SET input_tokens = input_tokens + %s,
+                                   output_tokens = output_tokens + %s, cost_usd = cost_usd + %s
+                               WHERE job_id = %s AND step_name = %s AND input_hash = %s
+                                 AND attempt_number = %s""",
+                            (inputs, outputs, cost, *usage_key),
+                        )
+
+                context = StepContext(
+                    job["id"], step.name, digest, self.database_url, _record_usage=record_usage,
+                )
                 try:
                     result = self._invoke(step, context, value)
                     input_hash(result)  # Reject non-JSON results, including NaN.
@@ -445,9 +500,8 @@ class Runner:
                         (error, delay, *key),
                     )
                 else:
-                    # Only successfully saved steps count toward spend. Failed,
-                    # timed-out and interrupted attempts are excluded. Usage and
-                    # result commit atomically; cached steps never add it again.
+                    # Attempt usage is already durable; saving or reusing a
+                    # result never adds that usage again.
                     conn.execute(
                         """INSERT INTO steps (job_id, step_name, input_hash, result,
                                               input_tokens, output_tokens, cost_usd)
