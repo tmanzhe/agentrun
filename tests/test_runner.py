@@ -3,6 +3,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+from threading import Event, Thread
 import time
 from uuid import UUID, uuid4
 
@@ -151,6 +152,188 @@ def test_step_error_is_terminal_and_keeps_finished_steps(database_url):
     assert not runner.run_once()
     with pytest.raises(ValueError, match="Unknown job type"):
         runner.submit("missing")
+
+
+@pytest.mark.parametrize("succeed_after", [3, 4])
+def test_retry_backoff_and_exhaustion(database_url, succeed_after):
+    executions = []
+    starts = []
+    keys = []
+
+    def flaky(context, value):
+        starts.append(time.monotonic())
+        keys.append(context.idempotency_key)
+        job = runner.status(context.job_id)
+        # Previous failures are visible as attempts, never as cached results.
+        assert [row["step_name"] for row in job["steps"]] == ["prefix"]
+        attempt = next(row for row in job["attempts"] if row["step_name"] == "flaky")
+        assert attempt["attempt_count"] == len(starts)
+        if len(starts) < succeed_after:
+            raise ValueError(f"failure {len(starts)}")
+        return {"done": value}
+
+    runner = Runner({"retry": Job((
+        Step("prefix", lambda c, v: executions.append(v) or v),
+        Step("flaky", flaky, max_attempts=3, base_delay=0.06),
+    ))})
+    job_id = runner.submit("retry", "input")
+    assert runner.run_once()
+    job = json.loads(cli("status", str(job_id)).stdout)
+    assert executions == ["input"]
+    assert len(starts) == 3
+    assert len(set(keys)) == 1
+    assert starts[1] - starts[0] >= 0.06
+    assert starts[2] - starts[1] >= 0.12
+    attempt = next(row for row in job["attempts"] if row["step_name"] == "flaky")
+    assert attempt["attempt_count"] == 3
+    if succeed_after == 3:
+        assert job["status"] == "succeeded"
+        assert job["result"] == {"done": "input"}
+        assert len(job["steps"]) == 2
+        assert attempt["last_error"] == "ValueError: failure 2"
+    else:
+        assert job["status"] == "failed"
+        assert job["error"] == attempt["last_error"] == "ValueError: failure 3"
+        assert [row["step_name"] for row in job["steps"]] == ["prefix"]
+    assert not runner.run_once()
+
+
+@pytest.mark.parametrize("recover", [False, True])
+def test_timeout_retries_and_abandons_late_results(database_url, recover):
+    release = Event()
+    finished = Event()
+    starts = []
+    prefixes = []
+
+    def slow(context, value):
+        starts.append(context.idempotency_key)
+        if recover and len(starts) == 2:
+            return "retry success"
+        release.wait(5)
+        finished.set()
+        return "late result"
+
+    runner = Runner({"timeout": Job((
+        Step("prefix", lambda c, v: prefixes.append(v) or v),
+        Step("slow", slow, timeout=0.05, max_attempts=2, base_delay=0.02),
+    ))})
+    job_id = runner.submit("timeout", "input")
+    try:
+        started = time.monotonic()
+        assert runner.run_once()
+        assert time.monotonic() - started < 2  # Does not await abandoned code.
+        before = runner.status(job_id)
+        assert len(starts) == 2
+        assert len(set(starts)) == 1
+        assert prefixes == ["input"]
+        attempt = next(row for row in before["attempts"] if row["step_name"] == "slow")
+        assert attempt["attempt_count"] == 2
+        assert attempt["last_error"] == "TimeoutError: Step slow exceeded 0.05s timeout"
+        if recover:
+            assert before["status"] == "succeeded"
+            assert before["result"] == "retry success"
+            assert len(before["steps"]) == 2
+        else:
+            assert before["status"] == "failed"
+            assert before["error"] == attempt["last_error"]
+            assert [row["step_name"] for row in before["steps"]] == ["prefix"]
+    finally:
+        release.set()
+    assert finished.wait(2)
+    assert runner.status(job_id) == before  # Late returns cannot overwrite success.
+    assert not runner.run_once()
+
+
+def test_cli_cancel_running_job_preserves_finished_steps(runner):
+    job_id = runner.submit("example", {"sleep": 0.7})
+    worker = subprocess.Popen(
+        [CLI, "worker", "--once", "--lease-seconds", "0.2"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        def second_step_running():
+            assert worker.poll() is None, worker.communicate()
+            job = runner.status(job_id)
+            if len(job["steps"]) == 1 and len(calls_for(runner, job_id)) == 2:
+                return job
+
+        before = wait_until(second_step_running)
+        cancelled = json.loads(cli("cancel", str(job_id)).stdout)
+        assert cancelled["status"] == "cancelled"
+        worker.communicate(timeout=5)
+        assert worker.returncode == 0
+        after = runner.status(job_id)
+        assert after["status"] == "cancelled"
+        assert after["steps"][0] == before["steps"][0]
+        assert [row["step_name"] for row in after["steps"]] == ["draft", "review"]
+        assert [row["step_name"] for row in calls_for(runner, job_id)] == ["draft", "review"]
+        assert not runner.run_once()
+        assert json.loads(cli("cancel", str(job_id)).stdout)["status"] == "cancelled"
+
+        pending = runner.submit("example", {"sleep": 0})
+        assert json.loads(cli("cancel", str(pending)).stdout)["status"] == "cancelled"
+        assert not runner.run_once()
+        assert calls_for(runner, pending) == []
+        assert cli("cancel", str(uuid4()), check=False).returncode == 1
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+        worker.communicate(timeout=5)
+
+
+def test_cancel_during_backoff(database_url):
+    calls = []
+
+    def fail(context, value):
+        calls.append(value)
+        raise ValueError("retry later")
+
+    runner = Runner({"backoff": Job((Step("fail", fail, base_delay=10),))})
+    job_id = runner.submit("backoff", "input")
+    worker = Thread(target=runner.run_once, daemon=True)
+    worker.start()
+    try:
+        wait_until(lambda: any(row["last_error"] for row in runner.status(job_id)["attempts"]))
+        assert json.loads(cli("cancel", str(job_id)).stdout)["status"] == "cancelled"
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert runner.status(job_id)["status"] == "cancelled"
+        assert calls == ["input"]
+        assert not runner.run_once()
+    finally:
+        runner.cancel(job_id)
+        worker.join(timeout=2)
+
+
+def test_m1_upgrade_reuses_saved_steps(database_url):
+    executions = []
+    jobs = {"upgrade": Job((
+        Step("prefix", lambda c, v: executions.append(v) or v),
+        Step("suffix", lambda c, v: v),
+    ))}
+    runner = Runner(jobs, lease_seconds=0.05)
+    job_id = runner.submit("upgrade", "input")
+    with runner.connect() as conn:
+        claim = runner._claim(conn)
+        runner._step(conn, claim, jobs["upgrade"].steps[0], "input")
+        # Reproduce M1's schema and a saved prefix without any attempt records.
+        conn.execute("DROP TABLE step_attempts, job_cancellations")
+        conn.execute("ALTER TABLE jobs DROP CONSTRAINT jobs_status_check")
+        conn.execute("""ALTER TABLE jobs ADD CONSTRAINT jobs_status_check
+                        CHECK (status IN ('queued', 'running', 'succeeded', 'failed'))""")
+    upgraded = Runner(jobs, lease_seconds=0.05)
+    before = upgraded.status(job_id)["steps"]
+    wait_until(lambda: expired(upgraded, job_id))
+    assert upgraded.run_once()
+    after = upgraded.status(job_id)
+    assert after["status"] == "succeeded"
+    assert after["steps"][:1] == before
+    assert executions == ["input"]
+    assert [row["step_name"] for row in after["attempts"]] == ["suffix"]
+    pending = upgraded.submit("upgrade")
+    assert upgraded.cancel(pending)
+    assert upgraded.status(pending)["status"] == "cancelled"
+    assert not upgraded.run_once()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="requires SIGKILL")
