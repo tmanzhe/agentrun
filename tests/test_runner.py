@@ -110,7 +110,7 @@ def test_usage_accumulates_and_only_saved_successes_count(database_url):
 
 
 @pytest.mark.parametrize("cap, completed", [("0", 0), ("0.10", 1), ("0.15", 2), ("0.30", 3)])
-def test_cli_budget_stops_before_further_model_calls(runner, cap, completed):
+def test_cli_budget_stops_before_further_model_calls(runner, cap, completed, tmp_path):
     job_id = UUID(cli("submit", "example", '{"sleep":0}', "--max-usd", cap).stdout.strip())
     cli("worker", "--once")
     job = runner.status(job_id)
@@ -124,6 +124,15 @@ def test_cli_budget_stops_before_further_model_calls(runner, cap, completed):
     assert all(row["calls"] == row["requests"] == 1 for row in calls_for(runner, job_id))
     assert not runner.run_once()
     assert runner.status(job_id) == job
+    out = tmp_path / "replay"
+    cli("replay", str(job_id), "--out", str(out))
+    html = (out / "index.html").read_text()
+    assert f"<dd>{job['status']}</dd>" in html
+    assert f"<dt>Spend cap</dt><dd>${cap}</dd>" in html
+    assert f"<dt>Total cost</dt><dd>${job['cost_usd']}</dd>" in html
+    assert all(f"<h2>{name}</h2>" in html for name in ("draft", "review", "polish"))
+    if completed < 3:
+        assert "blocked by spend cap" in html
 
 
 @pytest.mark.parametrize("has_suffix", [False, True])
@@ -445,7 +454,7 @@ def test_m1_upgrade_reuses_saved_steps(database_url):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="requires SIGKILL")
-def test_sigkill_resume_never_repeats_paid_model_execution(runner):
+def test_sigkill_resume_never_repeats_paid_model_execution(runner, tmp_path):
     job_id = runner.submit("example", {"prompt": "crash test", "sleep": 1.5}, max_usd="0.30")
     worker = subprocess.Popen(
         [CLI, "worker", "--lease-seconds", "0.2"],
@@ -495,6 +504,15 @@ def test_sigkill_resume_never_repeats_paid_model_execution(runner):
             {"step_name": "polish", "calls": 1, "requests": 1},
             {"step_name": "review", "calls": 1, "requests": 2},
         ]
+        cli("replay", str(job_id), "--out", str(tmp_path))
+        html = (tmp_path / "index.html").read_text()
+        assert "<dt>Markers</dt><dd>resumed</dd>" in html
+        assert "cached on resume" in html
+        assert "resumed after 1 interrupted attempt(s)" in html
+        assert "<dt>Attempts</dt><dd>2</dd>" in html
+        assert "<dt>Status</dt><dd>succeeded</dd>" in html
+        assert "<dt>Total cost</dt><dd>$0.30</dd>" in html
+        assert after["attempts"][2]["interrupted_count"] == 1  # review (alphabetical order)
     finally:
         if worker.poll() is None:
             worker.kill()
