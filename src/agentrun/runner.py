@@ -11,6 +11,8 @@ import hashlib
 import json
 import math
 import os
+from queue import Empty, Queue
+from threading import Thread
 import time
 from typing import Any
 from uuid import UUID, uuid4
@@ -27,7 +29,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     job_type text NOT NULL,
     input jsonb NOT NULL,
     status text NOT NULL DEFAULT 'queued'
-        CHECK (status IN ('queued', 'running', 'succeeded', 'failed')),
+        CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
     claim_token uuid,
     lease_until timestamptz,
     result jsonb,
@@ -43,6 +45,29 @@ CREATE TABLE IF NOT EXISTS steps (
     result jsonb NOT NULL,
     completed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (job_id, step_name, input_hash)
+);
+-- Also upgrade the status constraint on existing M1 databases.
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conrelid = 'jobs'::regclass
+        AND conname = 'jobs_status_check' AND pg_get_constraintdef(oid) LIKE '%cancelled%'
+    ) THEN
+        ALTER TABLE jobs DROP CONSTRAINT jobs_status_check;
+        ALTER TABLE jobs ADD CONSTRAINT jobs_status_check
+            CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled'));
+    END IF;
+END $$;
+CREATE TABLE IF NOT EXISTS step_attempts (
+    job_id uuid NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    step_name text NOT NULL,
+    input_hash text NOT NULL,
+    attempt_count integer NOT NULL DEFAULT 0,
+    last_error text,
+    next_attempt_at timestamptz,
+    PRIMARY KEY (job_id, step_name, input_hash)
+);
+CREATE TABLE IF NOT EXISTS job_cancellations (
+    job_id uuid PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE
 );
 """
 
@@ -71,8 +96,25 @@ class StepContext:
 
 @dataclass(frozen=True)
 class Step:
+    """Retry at base_delay * 2**(attempt - 1); timeout=None disables the limit."""
+
     name: str
     run: Callable[[StepContext, Any], Any]
+    max_attempts: int = 3
+    base_delay: float = 0.2
+    timeout: float | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_attempts, bool)
+            or not isinstance(self.max_attempts, int)
+            or self.max_attempts < 1
+        ):
+            raise ValueError("max_attempts must be a positive integer")
+        if not math.isfinite(self.base_delay) or self.base_delay < 0:
+            raise ValueError("base_delay must be nonnegative and finite")
+        if self.timeout is not None and (not math.isfinite(self.timeout) or self.timeout <= 0):
+            raise ValueError("timeout must be positive and finite")
 
 
 @dataclass(frozen=True)
@@ -86,6 +128,14 @@ class Job:
 
 
 class LostClaim(RuntimeError):
+    pass
+
+
+class Cancelled(RuntimeError):
+    pass
+
+
+class AttemptsExhausted(RuntimeError):
     pass
 
 
@@ -132,15 +182,47 @@ class Runner:
                        WHERE job_id = %s ORDER BY completed_at, step_name""",
                     (job_id,),
                 ).fetchall()
+                job["attempts"] = conn.execute(
+                    """SELECT step_name, input_hash, attempt_count, last_error, next_attempt_at
+                       FROM step_attempts WHERE job_id = %s ORDER BY step_name, input_hash""",
+                    (job_id,),
+                ).fetchall()
+                if job["status"] in ("queued", "running") and conn.execute(
+                    "SELECT 1 FROM job_cancellations WHERE job_id = %s", (job_id,)
+                ).fetchone():
+                    job["status"] = "cancelled"
             return job
+
+    def cancel(self, job_id: UUID) -> bool:
+        with self.connect() as conn, conn.transaction():
+            if conn.execute("SELECT 1 FROM jobs WHERE id = %s", (job_id,)).fetchone() is None:
+                return False
+            # The worker holds NO KEY UPDATE, so this FK's KEY SHARE lock
+            # permits cancellation while a step is running.
+            conn.execute(
+                """INSERT INTO job_cancellations (job_id)
+                   SELECT id FROM jobs WHERE id = %s AND status IN ('queued', 'running')
+                   ON CONFLICT DO NOTHING""",
+                (job_id,),
+            )
+            conn.execute(
+                """UPDATE jobs SET status = 'cancelled', claim_token = NULL, lease_until = NULL
+                   WHERE id IN (
+                       SELECT id FROM jobs WHERE id = %s AND status IN ('queued', 'running')
+                       FOR NO KEY UPDATE SKIP LOCKED
+                   )""",
+                (job_id,),
+            )
+            return True
 
     def _claim(self, conn) -> dict | None:
         with conn.transaction():
             job = conn.execute(
                 """SELECT * FROM jobs
-                   WHERE status = 'queued'
-                      OR (status = 'running' AND lease_until < clock_timestamp())
-                   ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED"""
+                   WHERE (status = 'queued'
+                      OR (status = 'running' AND lease_until < clock_timestamp()))
+                     AND NOT EXISTS (SELECT 1 FROM job_cancellations WHERE job_id = jobs.id)
+                   ORDER BY created_at, id LIMIT 1 FOR NO KEY UPDATE SKIP LOCKED"""
             ).fetchone()
             if job is None:
                 return None
@@ -153,54 +235,135 @@ class Runner:
             )
             return job
 
-    def _lock_claim(self, conn, job: dict) -> None:
+    def _lock_claim(self, conn, job: dict, *, check_cancel: bool = True) -> None:
         owner = conn.execute(
-            "SELECT claim_token FROM jobs WHERE id = %s FOR UPDATE", (job["id"],)
+            "SELECT claim_token FROM jobs WHERE id = %s FOR NO KEY UPDATE", (job["id"],)
         ).fetchone()
         if owner is None or owner["claim_token"] != job["claim_token"]:
             raise LostClaim(f"Job {job['id']} was reclaimed")
+        if check_cancel and self._is_cancelled(conn, job):
+            raise Cancelled()
+
+    def _is_cancelled(self, conn, job: dict) -> bool:
+        return conn.execute(
+            "SELECT 1 FROM job_cancellations WHERE job_id = %s", (job["id"],)
+        ).fetchone() is not None
+
+    def _renew(self, conn, job: dict) -> None:
+        conn.execute(
+            """UPDATE jobs SET lease_until = clock_timestamp() + %s * interval '1 second'
+               WHERE id = %s""",
+            (self.lease_seconds, job["id"]),
+        )
+
+    @staticmethod
+    def _invoke(step: Step, context: StepContext, value: Any) -> Any:
+        if step.timeout is None:
+            return step.run(context, value)
+        # A daemon thread bounds our wait, not the function's lifetime. Python
+        # cannot safely kill a thread: timed-out code may continue doing I/O.
+        # It cannot write the cache, and late results are abandoned. External
+        # effects still need context.idempotency_key across concurrent retries.
+        outcome = Queue(maxsize=1)
+        # Abandoned code must not mutate the input of a subsequent attempt.
+        value = json.loads(json.dumps(value, allow_nan=False))
+
+        def run():
+            try:
+                outcome.put((True, step.run(context, value)))
+            except BaseException as exc:
+                outcome.put((False, exc))
+
+        Thread(target=run, daemon=True).start()
+        try:
+            succeeded, result = outcome.get(timeout=step.timeout)
+        except Empty:
+            raise TimeoutError(f"Step {step.name} exceeded {step.timeout:g}s timeout") from None
+        if not succeeded:
+            raise result
+        return result
 
     def _step(self, conn, job: dict, step: Step, value: Any) -> Any:
         digest = input_hash(value)
-        with conn.transaction():
-            # A long step can outlive its lease. This lock prevents reclaiming it
-            # until its transaction ends, without a heartbeat thread.
-            self._lock_claim(conn, job)
-            saved = conn.execute(
-                """SELECT result FROM steps
-                   WHERE job_id = %s AND step_name = %s AND input_hash = %s""",
-                (job["id"], step.name, digest),
-            ).fetchone()
-            if saved is not None:
-                result = saved["result"]
-            else:
+        key = (job["id"], step.name, digest)
+        while True:
+            with conn.transaction():
+                self._lock_claim(conn, job)
+                saved = conn.execute(
+                    """SELECT result FROM steps
+                       WHERE job_id = %s AND step_name = %s AND input_hash = %s""", key,
+                ).fetchone()
+                if saved is not None:
+                    self._renew(conn, job)
+                    return saved["result"]
+                attempt = conn.execute(
+                    """SELECT *, EXTRACT(EPOCH FROM next_attempt_at - clock_timestamp()) AS wait
+                       FROM step_attempts
+                       WHERE job_id = %s AND step_name = %s AND input_hash = %s""", key,
+                ).fetchone()
+                if attempt is not None:
+                    if attempt["attempt_count"] >= step.max_attempts:
+                        raise AttemptsExhausted(attempt["last_error"] or "Attempt interrupted by worker exit")
+                    # Keep the job locked during backoff to prevent reclaiming it,
+                    # while polling the independently committed cancel request.
+                    deadline = time.monotonic() + max(0, float(attempt["wait"] or 0))
+                    while (remaining := deadline - time.monotonic()) > 0:
+                        time.sleep(min(0.05, remaining))
+                        self._lock_claim(conn, job)
+                # Commit before user code: even an interrupted attempt counts.
+                # Saved successes are checked first and never consume attempts.
+                attempt = conn.execute(
+                    """INSERT INTO step_attempts (job_id, step_name, input_hash, attempt_count)
+                       VALUES (%s, %s, %s, 1)
+                       ON CONFLICT (job_id, step_name, input_hash) DO UPDATE
+                           SET attempt_count = step_attempts.attempt_count + 1, next_attempt_at = NULL
+                       RETURNING attempt_count""", key,
+                ).fetchone()
+                self._renew(conn, job)
+            with conn.transaction():
+                # Fence stale workers even when execution outlives the lease.
+                self._lock_claim(conn, job)
                 context = StepContext(job["id"], step.name, digest, self.database_url)
-                result = step.run(context, value)
-                input_hash(result)  # Also reject NaN, which PostgreSQL JSON disallows.
-                conn.execute(
-                    "INSERT INTO steps (job_id, step_name, input_hash, result) VALUES (%s, %s, %s, %s)",
-                    (job["id"], step.name, digest, Jsonb(result)),
-                )
-            conn.execute(
-                """UPDATE jobs SET lease_until = clock_timestamp() + %s * interval '1 second'
-                   WHERE id = %s""",
-                (self.lease_seconds, job["id"]),
-            )
-            # Normalize even fresh outputs through JSON, so resume uses the same
-            # types (e.g. a returned tuple becomes a list in both executions).
-            return json.loads(json.dumps(result, allow_nan=False))
+                try:
+                    result = self._invoke(step, context, value)
+                    input_hash(result)  # Reject non-JSON results, including NaN.
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    # Saturate at one day to keep large retry policies finite.
+                    delay = min(
+                        step.base_delay * 2.0 ** min(attempt["attempt_count"] - 1, 1023),
+                        86400.0,
+                    )
+                    conn.execute(
+                        """UPDATE step_attempts SET last_error = %s,
+                               next_attempt_at = clock_timestamp() + %s * interval '1 second'
+                           WHERE job_id = %s AND step_name = %s AND input_hash = %s""",
+                        (error, delay, *key),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO steps (job_id, step_name, input_hash, result) VALUES (%s, %s, %s, %s)",
+                        (*key, Jsonb(result)),
+                    )
+                    self._renew(conn, job)
+                    # Normalize fresh outputs just as PostgreSQL does on resume.
+                    return json.loads(json.dumps(result, allow_nan=False))
+                self._renew(conn, job)
 
     def _finish(self, conn, job: dict, result: Any, error: str | None = None) -> None:
         with conn.transaction():
-            self._lock_claim(conn, job)
+            self._lock_claim(conn, job, check_cancel=False)
+            status = "failed" if error is not None else "succeeded"
+            if self._is_cancelled(conn, job):
+                status, result, error = "cancelled", None, None
             conn.execute(
                 """UPDATE jobs SET status = %s, result = %s, error = %s,
                        claim_token = NULL, lease_until = NULL WHERE id = %s""",
-                ("failed" if error is not None else "succeeded", Jsonb(result), error, job["id"]),
+                (status, Jsonb(result), error, job["id"]),
             )
 
     def run_once(self) -> bool:
-        """Run one claimable job. Failed jobs are recorded, without retrying."""
+        """Run one claimable job, retrying failed steps within their policy."""
         with self.connect() as conn:
             job = self._claim(conn)
             if job is None:
@@ -216,7 +379,8 @@ class Runner:
                 raise  # A broken DB connection is recovered through lease expiry.
             except Exception as exc:
                 try:
-                    self._finish(conn, job, None, f"{type(exc).__name__}: {exc}")
+                    error = str(exc) if isinstance(exc, AttemptsExhausted) else f"{type(exc).__name__}: {exc}"
+                    self._finish(conn, job, None, error)
                 except LostClaim:
                     pass
             return True
