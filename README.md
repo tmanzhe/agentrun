@@ -11,6 +11,7 @@ uv run agentrun submit example '{"prompt":"hello","sleep":0}' --max-usd 1.50
 uv run agentrun worker
 # In another terminal, using the printed UUID:
 uv run agentrun status <job_id>
+uv run agentrun replay <job_id> --out replay
 uv run agentrun cancel <job_id>
 uv run pytest
 ```
