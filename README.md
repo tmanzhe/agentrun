@@ -31,3 +31,5 @@ External model APIs **must durably honor `context.idempotency_key`** to avoid
 duplicate charges if a crash happens between a call and saving its result.
 The mock implements this; PostgreSQL alone cannot guarantee it for arbitrary APIs.
 Step errors mark a job failed; automatic retries are outside M1.
+
+Reported usage from every attempt, including failures and timeouts, counts toward job totals and `--max-usd`; the cap is checked before each retry.
