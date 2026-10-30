@@ -22,6 +22,9 @@ def main() -> None:
     status.add_argument("job_id", type=UUID)
     cancel = commands.add_parser("cancel", help="cancel a queued or running job")
     cancel.add_argument("job_id", type=UUID)
+    replay = commands.add_parser("replay", help="export a standalone HTML job timeline")
+    replay.add_argument("job_id", type=UUID)
+    replay.add_argument("--out", required=True, help="directory for index.html")
     args = parser.parse_args()
     try:
         runner = Runner(JOBS, lease_seconds=getattr(args, "lease_seconds", 2.0))
@@ -32,6 +35,8 @@ def main() -> None:
             print(runner.submit(args.job_type, args.input, max_usd=args.max_usd))
         elif args.command == "worker":
             runner.worker(once=args.once)
+        elif args.command == "replay":
+            print(runner.replay(args.job_id, args.out))
         else:
             if args.command == "cancel":
                 runner.cancel(args.job_id)
@@ -39,7 +44,7 @@ def main() -> None:
             if job is None:
                 parser.exit(1, "Job not found\n")
             print(json.dumps(job, default=str, indent=2))
-    except (psycopg.Error, ValueError) as exc:
+    except (psycopg.Error, ValueError, OSError) as exc:
         parser.exit(1, f"agentrun: {exc}\n")
     except KeyboardInterrupt:
         pass
