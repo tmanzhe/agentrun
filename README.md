@@ -10,6 +10,7 @@ uv run agentrun submit example '{"prompt":"hello","sleep":3}'
 uv run agentrun worker
 # In another terminal, using the printed UUID:
 uv run agentrun status <job_id>
+uv run agentrun cancel <job_id>
 uv run pytest
 ```
 
