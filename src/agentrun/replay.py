@@ -81,8 +81,17 @@ def write_replay(job: dict, out_dir: str | Path) -> Path:
             error_html = f"<p>Last error:</p><pre>{text(error)}</pre>" if error else ""
             input_html = payload("Input", attempt["input"]) if start else "<p>Input: unrecorded</p>"
             output_html = payload("Output", step["result"]) if step else "<p>Output: unavailable</p>"
+            usage_html = "".join(
+                "<h3>Attempt " + text(row["attempt_number"]) + "</h3>" + fields([
+                    ("Input tokens", row["input_tokens"]),
+                    ("Output tokens", row["output_tokens"]),
+                    ("Attempt cost", f"${row['cost_usd']}"),
+                ])
+                for row in job["attempt_usage"]
+                if (row["step_name"], row["input_hash"]) == key
+            )
             sections.append(
-                f"<section><h2>{text(name)}</h2>{metadata}{error_html}{input_html}{output_html}</section>"
+                f"<section><h2>{text(name)}</h2>{metadata}{usage_html}{error_html}{input_html}{output_html}</section>"
             )
     summary = fields([
         ("Job", job["id"]), ("Type", job["job_type"]), ("Status", job["status"]),
@@ -110,7 +119,7 @@ dt {{ font-weight: 600; }} dd {{ margin: 0; overflow-wrap: anywhere; }}
 pre {{ white-space: pre-wrap; overflow-wrap: anywhere; background: #eef2f6; padding: .75rem; }}
 details {{ margin: .75rem 0; }} summary {{ cursor: pointer; font-weight: 600; }}
 </style></head><body><h1>agentrun replay</h1>{summary}{error_html}
-<p>Usage totals and the cap count successfully saved steps only. Durations are wall time.
+<p>Usage totals and the cap count reported usage from every attempt, including failures and timeouts. Durations are wall time.
 Unknown values were not recorded by older workers.</p>
 {payload('Job input', job['input'])}{payload('Job output', job['result'])}
 <h2>Step timeline</h2>{''.join(sections)}</body></html>
