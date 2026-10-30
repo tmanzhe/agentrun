@@ -14,6 +14,7 @@ def main() -> None:
     submit = commands.add_parser("submit", help="enqueue a named job")
     submit.add_argument("job_type", choices=sorted(JOBS))
     submit.add_argument("input", nargs="?", type=json.loads, default={})
+    submit.add_argument("--max-usd", help="stop before another step once recorded spend reaches this amount")
     worker = commands.add_parser("worker", help="run jobs until interrupted")
     worker.add_argument("--once", action="store_true", help="try one job, then exit")
     worker.add_argument("--lease-seconds", type=float, default=2.0)
@@ -28,7 +29,7 @@ def main() -> None:
             conn.execute("SELECT pg_advisory_xact_lock(684921038)")
             conn.execute(MOCK_SCHEMA)
         if args.command == "submit":
-            print(runner.submit(args.job_type, args.input))
+            print(runner.submit(args.job_type, args.input, max_usd=args.max_usd))
         elif args.command == "worker":
             runner.worker(once=args.once)
         else:
