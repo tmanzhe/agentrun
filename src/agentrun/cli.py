@@ -19,6 +19,8 @@ def main() -> None:
     worker.add_argument("--lease-seconds", type=float, default=2.0)
     status = commands.add_parser("status", help="show a job and its saved steps")
     status.add_argument("job_id", type=UUID)
+    cancel = commands.add_parser("cancel", help="cancel a queued or running job")
+    cancel.add_argument("job_id", type=UUID)
     args = parser.parse_args()
     try:
         runner = Runner(JOBS, lease_seconds=getattr(args, "lease_seconds", 2.0))
@@ -30,6 +32,8 @@ def main() -> None:
         elif args.command == "worker":
             runner.worker(once=args.once)
         else:
+            if args.command == "cancel":
+                runner.cancel(args.job_id)
             job = runner.status(args.job_id)
             if job is None:
                 parser.exit(1, "Job not found\n")
