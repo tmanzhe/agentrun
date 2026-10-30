@@ -7,6 +7,7 @@ use a new job type name when changing a workflow.
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
@@ -29,7 +30,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     job_type text NOT NULL,
     input jsonb NOT NULL,
     status text NOT NULL DEFAULT 'queued'
-        CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+        CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled', 'over_budget')),
     claim_token uuid,
     lease_until timestamptz,
     result jsonb,
@@ -46,15 +47,29 @@ CREATE TABLE IF NOT EXISTS steps (
     completed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (job_id, step_name, input_hash)
 );
--- Also upgrade the status constraint on existing M1 databases.
+-- Also upgrade existing M1/M2 databases; old saved results have zero usage.
 DO $$ BEGIN
+    -- Avoid even no-op ALTER TABLE on startup: it would wait for live workers.
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute
+                   WHERE attrelid = 'jobs'::regclass AND attname = 'max_usd' AND NOT attisdropped) THEN
+        ALTER TABLE jobs ADD COLUMN max_usd numeric
+            CHECK (max_usd >= 0 AND max_usd < 'Infinity'::numeric);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute
+                   WHERE attrelid = 'steps'::regclass AND attname = 'cost_usd' AND NOT attisdropped) THEN
+        ALTER TABLE steps
+            ADD COLUMN input_tokens bigint NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
+            ADD COLUMN output_tokens bigint NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+            ADD COLUMN cost_usd numeric NOT NULL DEFAULT 0
+                CHECK (cost_usd >= 0 AND cost_usd < 'Infinity'::numeric);
+    END IF;
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint WHERE conrelid = 'jobs'::regclass
-        AND conname = 'jobs_status_check' AND pg_get_constraintdef(oid) LIKE '%cancelled%'
+        AND conname = 'jobs_status_check' AND pg_get_constraintdef(oid) LIKE '%over_budget%'
     ) THEN
         ALTER TABLE jobs DROP CONSTRAINT jobs_status_check;
         ALTER TABLE jobs ADD CONSTRAINT jobs_status_check
-            CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled'));
+            CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled', 'over_budget'));
     END IF;
 END $$;
 CREATE TABLE IF NOT EXISTS step_attempts (
@@ -77,12 +92,38 @@ def input_hash(value: Any) -> str:
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
-@dataclass(frozen=True)
+def dollars(value: Decimal | float | str) -> Decimal:
+    try:
+        amount = Decimal(str(value))
+    except InvalidOperation:
+        raise ValueError("USD amounts must be nonnegative and finite") from None
+    if not amount.is_finite() or amount < 0:
+        raise ValueError("USD amounts must be nonnegative and finite")
+    return amount
+
+
+@dataclass
 class StepContext:
     job_id: UUID
     step_name: str
     input_hash: str
     database_url: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: Decimal = Decimal("0")
+
+    def report_usage(
+        self, *, input_tokens: int = 0, output_tokens: int = 0,
+        cost_usd: Decimal | float | str = 0,
+    ) -> None:
+        """Add usage for a model response; multiple calls within a step accumulate."""
+        for count in (input_tokens, output_tokens):
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ValueError("Token counts must be nonnegative integers")
+        amount = dollars(cost_usd)
+        self.input_tokens += input_tokens
+        self.output_tokens += output_tokens
+        self.cost_usd += amount
 
     @property
     def idempotency_key(self) -> str:
@@ -139,6 +180,10 @@ class AttemptsExhausted(RuntimeError):
     pass
 
 
+class OverBudget(RuntimeError):
+    pass
+
+
 class Runner:
     def __init__(
         self,
@@ -160,15 +205,18 @@ class Runner:
     def connect(self):
         return psycopg.connect(self.database_url, autocommit=True, row_factory=dict_row)
 
-    def submit(self, job_type: str, value: Any = None) -> UUID:
+    def submit(
+        self, job_type: str, value: Any = None, *, max_usd: Decimal | float | str | None = None,
+    ) -> UUID:
         if job_type not in self.jobs:
             raise ValueError(f"Unknown job type: {job_type}")
         input_hash(value)  # Reject non-JSON input before writing a job.
+        max_usd = None if max_usd is None else dollars(max_usd)
         job_id = uuid4()
         with self.connect() as conn:
             conn.execute(
-                "INSERT INTO jobs (id, job_type, input) VALUES (%s, %s, %s)",
-                (job_id, job_type, Jsonb(value)),
+                "INSERT INTO jobs (id, job_type, input, max_usd) VALUES (%s, %s, %s, %s)",
+                (job_id, job_type, Jsonb(value), max_usd),
             )
         return job_id
 
@@ -178,10 +226,13 @@ class Runner:
             job = conn.execute("SELECT * FROM jobs WHERE id = %s", (job_id,)).fetchone()
             if job is not None:
                 job["steps"] = conn.execute(
-                    """SELECT step_name, input_hash, result, completed_at FROM steps
+                    """SELECT step_name, input_hash, result, completed_at,
+                              input_tokens, output_tokens, cost_usd FROM steps
                        WHERE job_id = %s ORDER BY completed_at, step_name""",
                     (job_id,),
                 ).fetchall()
+                for field in ("input_tokens", "output_tokens", "cost_usd"):
+                    job[field] = sum((step[field] for step in job["steps"]), 0)
                 job["attempts"] = conn.execute(
                     """SELECT step_name, input_hash, attempt_count, last_error, next_attempt_at
                        FROM step_attempts WHERE job_id = %s ORDER BY step_name, input_hash""",
@@ -296,6 +347,15 @@ class Runner:
                 if saved is not None:
                     self._renew(conn, job)
                     return saved["result"]
+                # Check only unsaved steps, under the claim lock. A step may
+                # cross the cap; its price is only known after it returns.
+                if job["max_usd"] is not None:
+                    spend = conn.execute(
+                        "SELECT COALESCE(SUM(cost_usd), 0) AS total FROM steps WHERE job_id = %s",
+                        (job["id"],),
+                    ).fetchone()["total"]
+                    if spend >= job["max_usd"]:
+                        raise OverBudget("Recorded spend reached the job's max_usd")
                 attempt = conn.execute(
                     """SELECT *, EXTRACT(EPOCH FROM next_attempt_at - clock_timestamp()) AS wait
                        FROM step_attempts
@@ -341,19 +401,27 @@ class Runner:
                         (error, delay, *key),
                     )
                 else:
+                    # Only successfully saved steps count toward spend. Failed,
+                    # timed-out and interrupted attempts are excluded. Usage and
+                    # result commit atomically; cached steps never add it again.
                     conn.execute(
-                        "INSERT INTO steps (job_id, step_name, input_hash, result) VALUES (%s, %s, %s, %s)",
-                        (*key, Jsonb(result)),
+                        """INSERT INTO steps (job_id, step_name, input_hash, result,
+                                              input_tokens, output_tokens, cost_usd)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                        (*key, Jsonb(result), context.input_tokens, context.output_tokens, context.cost_usd),
                     )
                     self._renew(conn, job)
                     # Normalize fresh outputs just as PostgreSQL does on resume.
                     return json.loads(json.dumps(result, allow_nan=False))
                 self._renew(conn, job)
 
-    def _finish(self, conn, job: dict, result: Any, error: str | None = None) -> None:
+    def _finish(
+        self, conn, job: dict, result: Any, error: str | None = None,
+        *, status: str | None = None,
+    ) -> None:
         with conn.transaction():
             self._lock_claim(conn, job, check_cancel=False)
-            status = "failed" if error is not None else "succeeded"
+            status = status or ("failed" if error is not None else "succeeded")
             if self._is_cancelled(conn, job):
                 status, result, error = "cancelled", None, None
             conn.execute(
@@ -380,7 +448,10 @@ class Runner:
             except Exception as exc:
                 try:
                     error = str(exc) if isinstance(exc, AttemptsExhausted) else f"{type(exc).__name__}: {exc}"
-                    self._finish(conn, job, None, error)
+                    self._finish(
+                        conn, job, None, error,
+                        status="over_budget" if isinstance(exc, OverBudget) else None,
+                    )
                 except LostClaim:
                     pass
             return True
