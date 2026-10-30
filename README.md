@@ -7,6 +7,7 @@ Python 3.12+, uv, and PostgreSQL 17. Start a local database with
 uv sync
 export DATABASE_URL=postgresql://postgres@localhost:5432/agentrun
 uv run agentrun submit example '{"prompt":"hello","sleep":3}'
+uv run agentrun submit example '{"prompt":"hello","sleep":0}' --max-usd 1.50
 uv run agentrun worker
 # In another terminal, using the printed UUID:
 uv run agentrun status <job_id>
