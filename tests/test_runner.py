@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 from pathlib import Path
 import signal
 import subprocess
@@ -9,7 +10,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from agentrun import Job, Runner, Step
+from agentrun import Job, Runner, Step, StepContext
 from agentrun.runner import LostClaim, input_hash
 
 
@@ -65,11 +66,111 @@ def test_cli_submit_worker_status(database_url):
     assert [step["step_name"] for step in job["steps"]] == ["draft", "review", "polish"]
     assert len(job["result"]["answers"]) == 3
     assert job["result"]["prompt"] == "test"
+    assert (job["input_tokens"], job["output_tokens"], job["cost_usd"]) == (30, 15, "0.30")
+    assert all(
+        (step["input_tokens"], step["output_tokens"], step["cost_usd"]) == (10, 5, "0.10")
+        for step in job["steps"]
+    )
     runner = Runner({})
     assert all(row["calls"] == row["requests"] == 1 for row in calls_for(runner, job_id))
     assert not runner.run_once()
     assert cli("status", str(uuid4()), check=False).returncode == 1
     assert cli("submit", "example", "{bad json", check=False).returncode != 0
+
+
+def test_usage_accumulates_and_only_saved_successes_count(database_url):
+    calls = []
+
+    def flaky(context, value):
+        calls.append(value)
+        context.report_usage(input_tokens=10, output_tokens=2, cost_usd=0.1)
+        if len(calls) == 1:
+            raise ValueError("paid call failed")
+        context.report_usage(input_tokens=5, output_tokens=3, cost_usd="0.20")
+        return value
+
+    runner = Runner({"usage": Job((
+        Step("flaky", flaky, base_delay=0),
+        Step("free", lambda c, v: v),
+    ))})
+    job_id = runner.submit("usage", "input", max_usd="0.31")
+    before = runner.status(job_id)
+    assert (before["input_tokens"], before["output_tokens"], before["cost_usd"]) == (0, 0, 0)
+    assert runner.run_once()
+    job = runner.status(job_id)
+    assert job["status"] == "succeeded"
+    assert job["max_usd"] == Decimal("0.31")
+    assert (job["input_tokens"], job["output_tokens"], job["cost_usd"]) == (15, 5, Decimal("0.30"))
+    first, free = job["steps"]
+    assert (first["input_tokens"], first["output_tokens"], first["cost_usd"]) == (15, 5, Decimal("0.30"))
+    assert (free["input_tokens"], free["output_tokens"], free["cost_usd"]) == (0, 0, 0)
+    assert calls == ["input", "input"]
+    assert not runner.run_once()
+    assert runner.status(job_id) == job
+
+
+@pytest.mark.parametrize("cap, completed", [("0", 0), ("0.10", 1), ("0.15", 2), ("0.30", 3)])
+def test_cli_budget_stops_before_further_model_calls(runner, cap, completed):
+    job_id = UUID(cli("submit", "example", '{"sleep":0}', "--max-usd", cap).stdout.strip())
+    cli("worker", "--once")
+    job = runner.status(job_id)
+    assert job["max_usd"] == Decimal(cap)
+    assert job["status"] == ("succeeded" if completed == 3 else "over_budget")
+    assert len(job["steps"]) == len(job["attempts"]) == completed
+    assert job["cost_usd"] == Decimal("0.10") * completed
+    assert job["input_tokens"] == 10 * completed
+    assert job["output_tokens"] == 5 * completed
+    assert len(calls_for(runner, job_id)) == completed
+    assert all(row["calls"] == row["requests"] == 1 for row in calls_for(runner, job_id))
+    assert not runner.run_once()
+    assert runner.status(job_id) == job
+
+
+@pytest.mark.parametrize("has_suffix", [False, True])
+def test_resume_at_cap_reuses_saved_steps(database_url, has_suffix):
+    calls = []
+
+    def paid(context, value):
+        calls.append(context.step_name)
+        context.report_usage(input_tokens=1, output_tokens=2, cost_usd="0.10")
+        return value
+
+    steps = (Step("prefix", paid),)
+    if has_suffix:
+        steps += (Step("suffix", paid),)
+    runner = Runner({"resume": Job(steps)}, lease_seconds=0.05)
+    job_id = runner.submit("resume", "input", max_usd="0.10")
+    with runner.connect() as conn:
+        claim = runner._claim(conn)
+        runner._step(conn, claim, steps[0], claim["input"])
+    before = runner.status(job_id)
+    wait_until(lambda: expired(runner, job_id))
+    assert runner.run_once()
+    after = runner.status(job_id)
+    assert after["status"] == ("over_budget" if has_suffix else "succeeded")
+    assert after["steps"] == before["steps"]
+    assert (after["input_tokens"], after["output_tokens"], after["cost_usd"]) == (1, 2, Decimal("0.10"))
+    assert calls == ["prefix"]
+    assert not runner.run_once()
+
+
+@pytest.mark.parametrize("field, value", [
+    ("input_tokens", -1), ("output_tokens", 1.5), ("input_tokens", True),
+    ("cost_usd", "-0.01"), ("cost_usd", "NaN"), ("cost_usd", "Infinity"),
+    ("cost_usd", "bad"),
+])
+def test_usage_rejects_invalid_values(field, value):
+    context = StepContext(uuid4(), "test", "hash", "unused")
+    with pytest.raises(ValueError):
+        context.report_usage(**{field: value})
+    assert (context.input_tokens, context.output_tokens, context.cost_usd) == (0, 0, 0)
+
+
+@pytest.mark.parametrize("value", [-1, float("nan"), float("inf"), True, "bad"])
+def test_submit_rejects_invalid_cap(runner, value):
+    with pytest.raises(ValueError):
+        runner.submit("example", max_usd=value)
+    assert not runner.run_once()
 
 
 def test_saved_null_is_reused_on_resume(database_url):
@@ -140,6 +241,7 @@ def test_expired_claim_is_fenced(database_url):
 
 def test_step_error_is_terminal_and_keeps_finished_steps(database_url):
     def fail(context, value):
+        context.report_usage(input_tokens=10, output_tokens=5, cost_usd="0.10")
         raise ValueError("model rejected input")
 
     runner = Runner({"bad": Job((Step("ok", lambda c, v: v), Step("bad", fail)))})
@@ -149,6 +251,7 @@ def test_step_error_is_terminal_and_keeps_finished_steps(database_url):
     assert job["status"] == "failed"
     assert job["error"] == "ValueError: model rejected input"
     assert [step["step_name"] for step in job["steps"]] == ["ok"]
+    assert (job["input_tokens"], job["output_tokens"], job["cost_usd"]) == (0, 0, 0)
     assert not runner.run_once()
     with pytest.raises(ValueError, match="Unknown job type"):
         runner.submit("missing")
@@ -207,6 +310,7 @@ def test_timeout_retries_and_abandons_late_results(database_url, recover):
 
     def slow(context, value):
         starts.append(context.idempotency_key)
+        context.report_usage(input_tokens=10, output_tokens=5, cost_usd="0.10")
         if recover and len(starts) == 2:
             return "retry success"
         release.wait(5)
@@ -223,6 +327,7 @@ def test_timeout_retries_and_abandons_late_results(database_url, recover):
         assert runner.run_once()
         assert time.monotonic() - started < 2  # Does not await abandoned code.
         before = runner.status(job_id)
+        assert before["cost_usd"] == (Decimal("0.10") if recover else 0)
         assert len(starts) == 2
         assert len(set(starts)) == 1
         assert prefixes == ["input"]
@@ -318,11 +423,14 @@ def test_m1_upgrade_reuses_saved_steps(database_url):
         runner._step(conn, claim, jobs["upgrade"].steps[0], "input")
         # Reproduce M1's schema and a saved prefix without any attempt records.
         conn.execute("DROP TABLE step_attempts, job_cancellations")
+        conn.execute("ALTER TABLE jobs DROP COLUMN max_usd")
+        conn.execute("ALTER TABLE steps DROP COLUMN input_tokens, DROP COLUMN output_tokens, DROP COLUMN cost_usd")
         conn.execute("ALTER TABLE jobs DROP CONSTRAINT jobs_status_check")
         conn.execute("""ALTER TABLE jobs ADD CONSTRAINT jobs_status_check
                         CHECK (status IN ('queued', 'running', 'succeeded', 'failed'))""")
     upgraded = Runner(jobs, lease_seconds=0.05)
     before = upgraded.status(job_id)["steps"]
+    assert (before[0]["input_tokens"], before[0]["output_tokens"], before[0]["cost_usd"]) == (0, 0, 0)
     wait_until(lambda: expired(upgraded, job_id))
     assert upgraded.run_once()
     after = upgraded.status(job_id)
@@ -338,7 +446,7 @@ def test_m1_upgrade_reuses_saved_steps(database_url):
 
 @pytest.mark.skipif(sys.platform == "win32", reason="requires SIGKILL")
 def test_sigkill_resume_never_repeats_paid_model_execution(runner):
-    job_id = runner.submit("example", {"prompt": "crash test", "sleep": 1.5})
+    job_id = runner.submit("example", {"prompt": "crash test", "sleep": 1.5}, max_usd="0.30")
     worker = subprocess.Popen(
         [CLI, "worker", "--lease-seconds", "0.2"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -354,6 +462,7 @@ def test_sigkill_resume_never_repeats_paid_model_execution(runner):
         before = wait_until(crash_window)
         assert before["status"] == "running"
         assert before["steps"][0]["step_name"] == "draft"
+        assert (before["input_tokens"], before["output_tokens"], before["cost_usd"]) == (10, 5, Decimal("0.10"))
         assert json.loads(cli("status", str(job_id)).stdout)["status"] == "running"
         # The review call is already paid and committed outside the runner's
         # transaction, but its step result has not been saved yet.
@@ -373,12 +482,14 @@ def test_sigkill_resume_never_repeats_paid_model_execution(runner):
         assert worker.returncode == -signal.SIGKILL
         assert len(runner.status(job_id)["steps"]) == 1
         assert len(calls_for(runner, job_id)) == 2  # Paid receipts survived SIGKILL.
+        assert runner.status(job_id)["cost_usd"] == Decimal("0.10")
 
         cli("worker", "--once", "--lease-seconds", "0.2")
         after = runner.status(job_id)
         assert after["status"] == "succeeded"
         assert len(after["steps"]) == len(after["result"]["answers"]) == 3
         assert after["steps"][0] == before["steps"][0]  # Cached prefix untouched.
+        assert (after["input_tokens"], after["output_tokens"], after["cost_usd"]) == (30, 15, Decimal("0.30"))
         assert calls_for(runner, job_id) == [
             {"step_name": "draft", "calls": 1, "requests": 1},
             {"step_name": "polish", "calls": 1, "requests": 1},
