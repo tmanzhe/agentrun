@@ -85,7 +85,7 @@ def test_replay_escapes_database_content_and_truncates_payloads(database_url, tm
     assert len(html) < PAYLOAD_LIMIT * 5
 
 
-def test_failed_attempt_usage_is_excluded_from_totals_and_cap(database_url):
+def test_failed_attempt_usage_counts_toward_totals_and_cap(database_url, tmp_path):
     calls = []
 
     def retry(context, value):
@@ -103,11 +103,16 @@ def test_failed_attempt_usage_is_excluded_from_totals_and_cap(database_url):
     job_id = runner.submit("failed-spend", "input", max_usd="0.01")
     assert runner.run_once()
     job = runner.status(job_id)
-    # The $100 failure does not stop the retry; the $0.01 success blocks the suffix.
-    assert calls == ["retry", "retry"]
+    # The paid failure blocks both the retry and the suffix.
+    assert calls == ["retry"]
     assert job["status"] == "over_budget"
-    assert (job["input_tokens"], job["output_tokens"], job["cost_usd"]) == (1, 2, Decimal("0.01"))
-    assert job["attempts"][0]["attempt_count"] == 2
+    assert (job["input_tokens"], job["output_tokens"], job["cost_usd"]) == (1000, 2000, Decimal("100"))
+    assert job["attempts"][0]["attempt_count"] == 1
+    assert job["attempt_usage"][0]["cost_usd"] == Decimal("100")
+    html = runner.replay(job_id, tmp_path).read_text()
+    StaticHTML().feed(html)
+    assert "<dt>Attempt cost</dt><dd>$100</dd>" in html
+    assert "<dt>Total cost</dt><dd>$100</dd>" in html
 
 
 def test_replay_m3_upgrade_is_idempotent(database_url, tmp_path):

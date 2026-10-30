@@ -78,7 +78,7 @@ def test_cli_submit_worker_status(database_url):
     assert cli("submit", "example", "{bad json", check=False).returncode != 0
 
 
-def test_usage_accumulates_and_only_saved_successes_count(database_url):
+def test_usage_accumulates_from_every_attempt(database_url):
     calls = []
 
     def flaky(context, value):
@@ -93,14 +93,14 @@ def test_usage_accumulates_and_only_saved_successes_count(database_url):
         Step("flaky", flaky, base_delay=0),
         Step("free", lambda c, v: v),
     ))})
-    job_id = runner.submit("usage", "input", max_usd="0.31")
+    job_id = runner.submit("usage", "input", max_usd="0.41")
     before = runner.status(job_id)
     assert (before["input_tokens"], before["output_tokens"], before["cost_usd"]) == (0, 0, 0)
     assert runner.run_once()
     job = runner.status(job_id)
     assert job["status"] == "succeeded"
-    assert job["max_usd"] == Decimal("0.31")
-    assert (job["input_tokens"], job["output_tokens"], job["cost_usd"]) == (15, 5, Decimal("0.30"))
+    assert job["max_usd"] == Decimal("0.41")
+    assert (job["input_tokens"], job["output_tokens"], job["cost_usd"]) == (25, 7, Decimal("0.40"))
     first, free = job["steps"]
     assert (first["input_tokens"], first["output_tokens"], first["cost_usd"]) == (15, 5, Decimal("0.30"))
     assert (free["input_tokens"], free["output_tokens"], free["cost_usd"]) == (0, 0, 0)
@@ -260,7 +260,7 @@ def test_step_error_is_terminal_and_keeps_finished_steps(database_url):
     assert job["status"] == "failed"
     assert job["error"] == "ValueError: model rejected input"
     assert [step["step_name"] for step in job["steps"]] == ["ok"]
-    assert (job["input_tokens"], job["output_tokens"], job["cost_usd"]) == (0, 0, 0)
+    assert (job["input_tokens"], job["output_tokens"], job["cost_usd"]) == (30, 15, Decimal("0.30"))
     assert not runner.run_once()
     with pytest.raises(ValueError, match="Unknown job type"):
         runner.submit("missing")
@@ -336,7 +336,7 @@ def test_timeout_retries_and_abandons_late_results(database_url, recover):
         assert runner.run_once()
         assert time.monotonic() - started < 2  # Does not await abandoned code.
         before = runner.status(job_id)
-        assert before["cost_usd"] == (Decimal("0.10") if recover else 0)
+        assert before["cost_usd"] == Decimal("0.20")
         assert len(starts) == 2
         assert len(set(starts)) == 1
         assert prefixes == ["input"]
@@ -513,6 +513,109 @@ def test_sigkill_resume_never_repeats_paid_model_execution(runner, tmp_path):
         assert "<dt>Status</dt><dd>succeeded</dd>" in html
         assert "<dt>Total cost</dt><dd>$0.30</dd>" in html
         assert after["attempts"][2]["interrupted_count"] == 1  # review (alphabetical order)
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+        worker.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("timeout", [None, 0.03])
+def test_cap_stops_mid_retry(database_url, timeout):
+    calls = []
+    release = Event()
+
+    def paid_failure(context, value):
+        calls.append(value)
+        context.report_usage(input_tokens=4, output_tokens=2, cost_usd="0.10")
+        if timeout:
+            release.wait(5)
+        raise ValueError("paid failure")
+
+    runner = Runner({"retry-cap": Job((Step(
+        "paid", paid_failure, max_attempts=5, base_delay=0, timeout=timeout,
+    ),))})
+    job_id = runner.submit("retry-cap", "input", max_usd="0.20")
+    try:
+        assert runner.run_once()
+        job = runner.status(job_id)
+        assert job["status"] == "over_budget"
+        assert calls == ["input", "input"]
+        assert (job["input_tokens"], job["output_tokens"], job["cost_usd"]) == (8, 4, Decimal("0.20"))
+        assert [row["cost_usd"] for row in job["attempt_usage"]] == [Decimal("0.10")] * 2
+        assert job["steps"] == []
+        assert not runner.run_once()
+    finally:
+        release.set()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="requires SIGKILL")
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("cap", ["0.10", "0.30"])
+def test_sigkill_reported_attempt_usage_survives_once(database_url, failed, cap):
+    script = '''
+import sys
+import time
+from agentrun import Job, Runner, Step
+
+def paid(context, value):
+    context.report_usage(input_tokens=4, output_tokens=2, cost_usd="0.10")
+    attempt = runner.status(context.job_id)["attempts"][0]["attempt_count"]
+    if attempt == 1:
+        if sys.argv[1] == "True":
+            raise ValueError("paid failure")
+        time.sleep(60)
+    return value
+
+class CrashRunner(Runner):
+    def _finish(self, *args, **kwargs):
+        # Keep a crash window after the cap check, before terminal status commits.
+        time.sleep(60)
+        super()._finish(*args, **kwargs)
+
+runner = CrashRunner({"crash": Job((Step("paid", paid, base_delay=30),))}, lease_seconds=0.05)
+runner.run_once()
+'''
+    runner = Runner({"crash": Job((Step("paid", lambda c, v: (
+        c.report_usage(input_tokens=4, output_tokens=2, cost_usd="0.10") or v
+    )),))}, lease_seconds=0.05)
+    job_id = runner.submit("crash", "input", max_usd=cap)
+    worker = subprocess.Popen(
+        [sys.executable, "-c", script, str(failed)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        def reported():
+            assert worker.poll() is None, worker.communicate()
+            job = runner.status(job_id)
+            if job["cost_usd"] == Decimal("0.10") and (
+                not failed or job["attempts"][0]["last_error"]
+            ):
+                return job
+
+        before = wait_until(reported)
+        worker.send_signal(signal.SIGKILL)
+        worker.communicate(timeout=5)
+        assert worker.returncode == -signal.SIGKILL
+        assert runner.status(job_id)["cost_usd"] == Decimal("0.10")
+        wait_until(lambda: expired(runner, job_id))
+        with runner.connect() as conn:
+            conn.execute("UPDATE step_attempts SET next_attempt_at = NULL WHERE job_id = %s", (job_id,))
+        assert runner.run_once()
+        job = json.loads(cli("status", str(job_id)).stdout)
+        if cap == "0.10":
+            assert job["status"] == "over_budget"
+            assert job["cost_usd"] == "0.10"
+            assert len(job["attempt_usage"]) == 1
+            assert job["steps"] == []
+        else:
+            assert job["status"] == "succeeded"
+            assert job["cost_usd"] == "0.20"
+            assert len(job["attempt_usage"]) == 2
+            assert job["steps"][0]["cost_usd"] == "0.10"
+        assert job["attempt_usage"][0]["cost_usd"] == str(before["cost_usd"])
+        after = runner.status(job_id)
+        assert not runner.run_once()
+        assert runner.status(job_id) == after
     finally:
         if worker.poll() is None:
             worker.kill()
