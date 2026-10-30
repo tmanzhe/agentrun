@@ -84,6 +84,27 @@ CREATE TABLE IF NOT EXISTS step_attempts (
 CREATE TABLE IF NOT EXISTS job_cancellations (
     job_id uuid PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE
 );
+-- Replay metadata is nullable for jobs recorded before M4. As above, avoid
+-- taking an ALTER TABLE lock at every worker/CLI startup.
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute
+                   WHERE attrelid = 'jobs'::regclass AND attname = 'step_names' AND NOT attisdropped) THEN
+        ALTER TABLE jobs
+            ADD COLUMN step_names jsonb NOT NULL DEFAULT '[]',
+            ADD COLUMN started_at timestamptz,
+            ADD COLUMN finished_at timestamptz,
+            ADD COLUMN last_claimed_at timestamptz,
+            ADD COLUMN claim_count integer NOT NULL DEFAULT 0;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute
+                   WHERE attrelid = 'step_attempts'::regclass AND attname = 'started_at' AND NOT attisdropped) THEN
+        ALTER TABLE step_attempts
+            ADD COLUMN input jsonb,
+            ADD COLUMN started_at timestamptz,
+            ADD COLUMN finished_at timestamptz,
+            ADD COLUMN interrupted_count integer NOT NULL DEFAULT 0;
+    END IF;
+END $$;
 """
 
 
@@ -215,8 +236,10 @@ class Runner:
         job_id = uuid4()
         with self.connect() as conn:
             conn.execute(
-                "INSERT INTO jobs (id, job_type, input, max_usd) VALUES (%s, %s, %s, %s)",
-                (job_id, job_type, Jsonb(value), max_usd),
+                """INSERT INTO jobs (id, job_type, input, max_usd, step_names)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (job_id, job_type, Jsonb(value), max_usd,
+                 Jsonb([step.name for step in self.jobs[job_type].steps])),
             )
         return job_id
 
@@ -234,7 +257,8 @@ class Runner:
                 for field in ("input_tokens", "output_tokens", "cost_usd"):
                     job[field] = sum((step[field] for step in job["steps"]), 0)
                 job["attempts"] = conn.execute(
-                    """SELECT step_name, input_hash, attempt_count, last_error, next_attempt_at
+                    """SELECT step_name, input_hash, attempt_count, last_error, next_attempt_at,
+                              input, started_at, finished_at, interrupted_count
                        FROM step_attempts WHERE job_id = %s ORDER BY step_name, input_hash""",
                     (job_id,),
                 ).fetchall()
@@ -243,6 +267,15 @@ class Runner:
                 ).fetchone():
                     job["status"] = "cancelled"
             return job
+
+    def replay(self, job_id: UUID, out_dir):
+        """Export a consistent database snapshot as a standalone HTML replay."""
+        from .replay import write_replay
+
+        job = self.status(job_id)
+        if job is None:
+            raise ValueError("Job not found")
+        return write_replay(job, out_dir)
 
     def cancel(self, job_id: UUID) -> bool:
         with self.connect() as conn, conn.transaction():
@@ -257,7 +290,8 @@ class Runner:
                 (job_id,),
             )
             conn.execute(
-                """UPDATE jobs SET status = 'cancelled', claim_token = NULL, lease_until = NULL
+                """UPDATE jobs SET status = 'cancelled', claim_token = NULL, lease_until = NULL,
+                       finished_at = clock_timestamp()
                    WHERE id IN (
                        SELECT id FROM jobs WHERE id = %s AND status IN ('queued', 'running')
                        FOR NO KEY UPDATE SKIP LOCKED
@@ -280,6 +314,8 @@ class Runner:
             job["claim_token"] = uuid4()
             conn.execute(
                 """UPDATE jobs SET status = 'running', claim_token = %s,
+                       started_at = COALESCE(started_at, clock_timestamp()),
+                       last_claimed_at = clock_timestamp(), claim_count = claim_count + 1,
                        lease_until = clock_timestamp() + %s * interval '1 second'
                    WHERE id = %s""",
                 (job["claim_token"], self.lease_seconds, job["id"]),
@@ -349,6 +385,8 @@ class Runner:
                     return saved["result"]
                 # Check only unsaved steps, under the claim lock. A step may
                 # cross the cap; its price is only known after it returns.
+                # Failed-attempt spend is excluded from BOTH job totals and the
+                # cap: only usage committed with a successful result counts.
                 if job["max_usd"] is not None:
                     spend = conn.execute(
                         "SELECT COALESCE(SUM(cost_usd), 0) AS total FROM steps WHERE job_id = %s",
@@ -373,11 +411,17 @@ class Runner:
                 # Commit before user code: even an interrupted attempt counts.
                 # Saved successes are checked first and never consume attempts.
                 attempt = conn.execute(
-                    """INSERT INTO step_attempts (job_id, step_name, input_hash, attempt_count)
-                       VALUES (%s, %s, %s, 1)
+                    """INSERT INTO step_attempts (job_id, step_name, input_hash, attempt_count,
+                                                 input, started_at)
+                       VALUES (%s, %s, %s, 1, %s, clock_timestamp())
                        ON CONFLICT (job_id, step_name, input_hash) DO UPDATE
-                           SET attempt_count = step_attempts.attempt_count + 1, next_attempt_at = NULL
-                       RETURNING attempt_count""", key,
+                           SET attempt_count = step_attempts.attempt_count + 1, next_attempt_at = NULL,
+                               input = EXCLUDED.input,
+                               started_at = COALESCE(step_attempts.started_at, EXCLUDED.started_at),
+                               interrupted_count = step_attempts.interrupted_count +
+                                   CASE WHEN step_attempts.finished_at IS NULL THEN 1 ELSE 0 END,
+                               finished_at = NULL
+                       RETURNING attempt_count""", (*key, Jsonb(value)),
                 ).fetchone()
                 self._renew(conn, job)
             with conn.transaction():
@@ -395,7 +439,7 @@ class Runner:
                         86400.0,
                     )
                     conn.execute(
-                        """UPDATE step_attempts SET last_error = %s,
+                        """UPDATE step_attempts SET last_error = %s, finished_at = clock_timestamp(),
                                next_attempt_at = clock_timestamp() + %s * interval '1 second'
                            WHERE job_id = %s AND step_name = %s AND input_hash = %s""",
                         (error, delay, *key),
@@ -409,6 +453,10 @@ class Runner:
                                               input_tokens, output_tokens, cost_usd)
                            VALUES (%s, %s, %s, %s, %s, %s, %s)""",
                         (*key, Jsonb(result), context.input_tokens, context.output_tokens, context.cost_usd),
+                    )
+                    conn.execute(
+                        """UPDATE step_attempts SET finished_at = clock_timestamp()
+                           WHERE job_id = %s AND step_name = %s AND input_hash = %s""", key,
                     )
                     self._renew(conn, job)
                     # Normalize fresh outputs just as PostgreSQL does on resume.
@@ -426,6 +474,7 @@ class Runner:
                 status, result, error = "cancelled", None, None
             conn.execute(
                 """UPDATE jobs SET status = %s, result = %s, error = %s,
+                       finished_at = clock_timestamp(),
                        claim_token = NULL, lease_until = NULL WHERE id = %s""",
                 (status, Jsonb(result), error, job["id"]),
             )
