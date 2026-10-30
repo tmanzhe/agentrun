@@ -1,5 +1,9 @@
 # agentrun
 
+Crash-proof runner for long AI jobs. Jobs are Postgres-backed steps whose results are saved as they finish, so a job resumes after a crash (even `kill -9`) without repeating paid model calls, with retries, timeouts, cancel, spend caps and a static replay viewer.
+
+## Quickstart
+
 Python 3.12+, uv, and PostgreSQL 17. Start a local database with
 `docker compose up -d` (skip if Postgres is already running), then:
 
