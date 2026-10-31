@@ -37,3 +37,17 @@ The mock implements this; PostgreSQL alone cannot guarantee it for arbitrary API
 Step errors mark a job failed; automatic retries are outside M1.
 
 Reported usage from every attempt, including failures and timeouts, counts toward job totals and `--max-usd`; the cap is checked before each retry.
+
+## HN hiring demo
+
+`hn_hiring` turns supplied HN comments into listings with company, role, location,
+remote status and an application link, plus the source text and comment URL.
+The local mock reads `Company | Role | Location | REMOTE` headers. It skips
+replies, deleted comments and comments without that header format. Unknown fields
+stay null. No HN fetch or model API calls; the $0.10 usage is pretend.
+
+```sh
+uv run agentrun submit hn_hiring "$(cat examples/hn_hiring.json)"
+uv run agentrun worker --once
+# Use status or replay with the printed job ID to see the listings.
+```
