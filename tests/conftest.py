@@ -6,7 +6,8 @@ from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 import pytest
 
-from agentrun.example import JOBS, MOCK_SCHEMA
+from agentrun.jobs import JOBS
+from agentrun.mock import MOCK_SCHEMA
 from agentrun.runner import DEFAULT_DATABASE_URL, Runner
 
 
