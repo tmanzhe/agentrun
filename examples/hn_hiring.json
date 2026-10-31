@@ -1,0 +1,17 @@
+{
+  "thread_id": 100,
+  "comments": [
+    {
+      "id": 101,
+      "parent": 100,
+      "text": "Maple Labs | Backend Engineer | Toronto, Canada | REMOTE<p>Build Python tools. Full-time. Apply at <a href=\"https://example.com/jobs/backend\">our jobs page</a>."
+    },
+    {
+      "id": 102,
+      "parent": 100,
+      "text": "Cedar &amp; Co | Product Designer | Vancouver, Canada | ONSITE<p>Email <a href=\"mailto:jobs@example.com\">jobs@example.com</a>."
+    },
+    {"id": 103, "parent": 101, "text": "Do you hire in Europe?"},
+    {"id": 104, "deleted": true}
+  ]
+}

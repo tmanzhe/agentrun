@@ -4,7 +4,8 @@ from uuid import UUID
 
 import psycopg
 
-from .example import JOBS, MOCK_SCHEMA
+from .jobs import JOBS
+from .mock import MOCK_SCHEMA
 from .runner import Runner
 
 
