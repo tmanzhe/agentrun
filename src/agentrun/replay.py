@@ -37,7 +37,8 @@ def duration(start, end, now) -> str:
     return f"{seconds:.3f}s" + (" (ongoing)" if end is None else "")
 
 
-def write_replay(job: dict, out_dir: str | Path) -> Path:
+def render_replay(job: dict) -> str:
+    """Render recorded state without running a job or writing files."""
     now = datetime.now(timezone.utc)
     saved = {(row["step_name"], row["input_hash"]): row for row in job["steps"]}
     attempts = {(row["step_name"], row["input_hash"]): row for row in job["attempts"]}
@@ -104,7 +105,7 @@ def write_replay(job: dict, out_dir: str | Path) -> Path:
         ("Markers", "resumed" if job["claim_count"] > 1 else "none"),
     ])
     error_html = f"<p>Job error:</p><pre>{text(job['error'])}</pre>" if job["error"] else ""
-    html = f"""<!doctype html>
+    return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>agentrun replay {text(job['id'])}</title>
@@ -124,6 +125,10 @@ Unknown values were not recorded by older workers.</p>
 {payload('Job input', job['input'])}{payload('Job output', job['result'])}
 <h2>Step timeline</h2>{''.join(sections)}</body></html>
 """
+
+
+def write_replay(job: dict, out_dir: str | Path) -> Path:
+    html = render_replay(job)
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "index.html"

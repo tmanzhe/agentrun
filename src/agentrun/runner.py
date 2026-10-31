@@ -220,43 +220,31 @@ class OverBudget(RuntimeError):
     pass
 
 
-class Runner:
-    def __init__(
-        self,
-        jobs: Mapping[str, Job],
-        database_url: str | None = None,
-        *,
-        lease_seconds: float = 2.0,
-    ):
-        if not math.isfinite(lease_seconds) or lease_seconds <= 0:
-            raise ValueError("lease_seconds must be positive and finite")
-        self.jobs = dict(jobs)
+class JobReader:
+    """Read recorded state without creating tables or loading job definitions."""
+
+    def __init__(self, database_url: str | None = None):
         self.database_url = database_url or os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
-        self.lease_seconds = lease_seconds
-        with self.connect() as conn, conn.transaction():
-            # Serialize concurrent startup DDL (CREATE IF NOT EXISTS can race).
-            conn.execute("SELECT pg_advisory_xact_lock(684921038)")
-            conn.execute(SCHEMA)
 
     def connect(self):
         return psycopg.connect(self.database_url, autocommit=True, row_factory=dict_row)
 
-    def submit(
-        self, job_type: str, value: Any = None, *, max_usd: Decimal | float | str | None = None,
-    ) -> UUID:
-        if job_type not in self.jobs:
-            raise ValueError(f"Unknown job type: {job_type}")
-        input_hash(value)  # Reject non-JSON input before writing a job.
-        max_usd = None if max_usd is None else dollars(max_usd)
-        job_id = uuid4()
-        with self.connect() as conn:
-            conn.execute(
-                """INSERT INTO jobs (id, job_type, input, max_usd, step_names)
-                   VALUES (%s, %s, %s, %s, %s)""",
-                (job_id, job_type, Jsonb(value), max_usd,
-                 Jsonb([step.name for step in self.jobs[job_type].steps])),
-            )
-        return job_id
+    def list_jobs(self, limit: int = 20, offset: int = 0) -> list[dict]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer from 1 to 100")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be a nonnegative integer")
+        with self.connect() as conn, conn.transaction():
+            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            return conn.execute(
+                """SELECT id, job_type,
+                          CASE WHEN status IN ('queued', 'running') AND EXISTS (
+                              SELECT 1 FROM job_cancellations WHERE job_id = jobs.id
+                          ) THEN 'cancelled' ELSE status END AS status,
+                          created_at, started_at, finished_at, max_usd
+                   FROM jobs ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s""",
+                (limit, offset),
+            ).fetchall()
 
     def status(self, job_id: UUID) -> dict | None:
         with self.connect() as conn, conn.transaction():
@@ -303,6 +291,42 @@ class Runner:
                            AND a.input_hash = s.input_hash)
                ) usage""", (job_id, job_id),
         ).fetchone()
+
+
+class Runner(JobReader):
+    def __init__(
+        self,
+        jobs: Mapping[str, Job],
+        database_url: str | None = None,
+        *,
+        lease_seconds: float = 2.0,
+    ):
+        if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive and finite")
+        self.jobs = dict(jobs)
+        super().__init__(database_url)
+        self.lease_seconds = lease_seconds
+        with self.connect() as conn, conn.transaction():
+            # Serialize concurrent startup DDL (CREATE IF NOT EXISTS can race).
+            conn.execute("SELECT pg_advisory_xact_lock(684921038)")
+            conn.execute(SCHEMA)
+
+    def submit(
+        self, job_type: str, value: Any = None, *, max_usd: Decimal | float | str | None = None,
+    ) -> UUID:
+        if job_type not in self.jobs:
+            raise ValueError(f"Unknown job type: {job_type}")
+        input_hash(value)  # Reject non-JSON input before writing a job.
+        max_usd = None if max_usd is None else dollars(max_usd)
+        job_id = uuid4()
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO jobs (id, job_type, input, max_usd, step_names)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (job_id, job_type, Jsonb(value), max_usd,
+                 Jsonb([step.name for step in self.jobs[job_type].steps])),
+            )
+        return job_id
 
     def replay(self, job_id: UUID, out_dir):
         """Export a consistent database snapshot as a standalone HTML replay."""
